@@ -1,0 +1,224 @@
+name: Build APK
+on:
+  workflow_dispatch:
+    inputs:
+      variant:
+        description: "lean = walang ETC2, decode = ETC2 preview/export (texture2ddecoder), full = may etcpak din"
+        type: choice
+        options: [lean, decode, full]
+        default: full
+  push:
+    branches: [main]
+
+permissions:
+  contents: write   # kailangan para sa GitHub Release (APK)
+  actions: write    # kailangan para mag-delete ng lumang artifacts
+
+concurrency:
+  group: build-apk
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Linisin ang lumang artifacts (free storage quota)
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api --paginate "repos/${{ github.repository }}/actions/artifacts?per_page=100" \
+            --jq '.artifacts[].id' | while read -r id; do
+              gh api -X DELETE "repos/${{ github.repository }}/actions/artifacts/$id" >/dev/null || true
+            done
+          echo "old artifacts cleaned"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: System packages
+        run: |
+          set -x
+          for i in 1 2 3; do sudo apt-get update && break || sleep 10; done
+          for i in 1 2 3; do
+            sudo apt-get install -y --fix-missing git zip unzip autoconf libtool pkg-config \
+              zlib1g-dev libncurses5-dev libncursesw5-dev cmake \
+              libffi-dev libssl-dev automake libltdl-dev build-essential && break || sleep 15
+          done
+          sudo apt-get install -y libtinfo5 || sudo apt-get install -y libtinfo6 || true
+
+      - name: Python tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install "buildozer==1.5.0" "cython<3" virtualenv setuptools wheel pillow numpy
+
+      - name: Run core tests
+        run: |
+          python tests/test_core.py
+          python tests/test_storage_access.py
+          python tests/test_age_and_names.py
+          python tests/test_v132.py
+          python tests/test_fast_paths.py
+          python tests/test_far_lod.py
+          python tests/test_runtime_hide.py
+          python tests/test_ownerlock.py
+          python tests/test_beard_relief.py
+          python tests/test_packed_head.py
+          python tests/test_2k16_headers_audio_names.py
+          python tests/test_headhair_resize.py
+          python tests/test_headhair_cards.py
+
+      - name: Choose spec
+        run: |
+          case "${{ github.event.inputs.variant }}" in
+            full) cp buildozer.spec.full buildozer.spec ;;
+            decode) cp buildozer.spec.decode buildozer.spec ;;
+          esac
+
+      - name: Check roster engine (pure Python)
+        run: |
+          set -e
+          python3 -m py_compile main.py nba2k20/roster_core.py
+          python3 tests/test_roster.py
+
+      # v291: inaalis ang plaintext assets/license.json bago mag-package (zip-editable - kahit sino na may unzip
+      # tool pwedeng magbukas, i-set na lang "enabled": false, zip ulit, ayun na-crack na agad walang code na
+      # ginalaw). Ini-bake muna ang laman nito (api_url, enabled, atbp.) sa DEFAULTS ng nba2k20/license.py bago
+      # ito tanggalin, kaya walang pagbabago sa gana ng app - tingnan ang tools/bake_license_defaults.py.
+      - name: Bake license.json into code (production - walang zip-editable na license file sa APK)
+        run: |
+          set -e
+          python3 tools/bake_license_defaults.py .
+          python3 -m py_compile nba2k20/license.py
+
+      # v290: pag-protect ng source bago i-package - tinatakbo PAGKATAPOS ng lahat ng tests (sa totoong source
+      # pa rin lumalabas ang mga error dito), BAGO ang Build APK. Loader na nag-de-decompress/compile ng source
+      # SA DEVICE mismo (hindi sa build machine), kaya walang panganib na masira ang app dahil sa magkaibang
+      # Python version ng runner at ng naka-bundle sa Android - tingnan ang tools/protect_source.py.
+      - name: Protect source (obfuscation - hindi crypto-strength, pero hindi na basta mababasa sa text editor)
+        run: |
+          set -e
+          python3 tools/protect_source.py main.py cli.py nba2k20
+          python3 -m py_compile main.py cli.py nba2k20/*.py
+          echo "post-protect import sanity:"
+          python3 -c "import sys; sys.path.insert(0,'.'); from nba2k20 import service, iff_core, objmesh, render3d, photoproject, license, version; cfg=license.load_config(path='/nonexistent'); assert cfg['enabled'] is True; print('OK v'+str(version.VERSION_CODE), cfg['enabled'], cfg['api_url'])"
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.buildozer
+            .buildozer
+          key: buildozer-${{ github.event.inputs.variant || 'decode' }}-${{ hashFiles('buildozer.spec') }}
+          restore-keys: buildozer-${{ github.event.inputs.variant || 'decode' }}-
+
+      # Android Device ID (ANDROID_ID) depends on the APK's signing key.  A fresh runner makes a NEW debug key on
+      # every build, so every build had a different Device ID and the panel rejected the key (HWID mismatch).
+      # Put one fixed debug keystore in the repo secret DEBUG_KEYSTORE_B64 (see BUILD.md) and the ID stays the same.
+      - name: Fixed signing key (stable Device ID)
+        env:
+          KS: ${{ secrets.DEBUG_KEYSTORE_B64 }}
+        run: |
+          mkdir -p ~/.android
+          if [ -n "$KS" ]; then
+            echo "$KS" | base64 -d > ~/.android/debug.keystore
+            keytool -list -keystore ~/.android/debug.keystore -storepass android | head -n 6
+            echo "fixed keystore installed"
+          else
+            echo "::warning::Walang DEBUG_KEYSTORE_B64 secret - bagong signing key kada build = bagong Device ID kada build (tingnan ang BUILD.md)"
+          fi
+
+      - name: Build APK
+        run: |
+          set -o pipefail
+          # v272: the Gradle download (github.com/gradle/gradle-distributions) sometimes fails by itself: retry up to 3 times
+          for attempt in 1 2 3; do
+            if buildozer -v android debug 2>&1 | tee -a build.log; then exit 0; fi
+            echo "Build attempt $attempt failed - retrying in 20s"; sleep 20
+          done
+          exit 1
+
+      - name: Manifest report
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import glob, re
+          from xml.dom import minidom
+          files = glob.glob(".buildozer/android/platform/build-*/dists/*/src/main/AndroidManifest.xml")
+          if not files:
+              print("no generated AndroidManifest.xml")
+          for f in files:
+              text = open(f, encoding="utf-8").read()
+              print("FILE", f)
+              m = re.search(r"<application[^>]*>", text, re.S)
+              print("APPLICATION TAG:", m.group(0) if m else "not found")
+              print("legacy flag count:", text.count("requestLegacyExternalStorage"))
+              print("permissions:", re.findall(r'uses-permission[^>]*name="([^"]+)"', text))
+              try:
+                  minidom.parseString(text.encode("utf-8"))
+                  print("XML: OK")
+              except Exception as exc:
+                  print("XML PARSE ERROR:", exc)
+          PY
+
+      - name: Ihanda ang APK
+        if: success()
+        id: apk
+        run: |
+          V="${{ github.event.inputs.variant || 'decode' }}"
+          APK=$(ls bin/*.apk | head -n1)
+          cp "$APK" "nba2k20tool-${V}.apk"
+          echo "file=nba2k20tool-${V}.apk" >> "$GITHUB_OUTPUT"
+          ls -lh nba2k20tool-${V}.apk
+
+      # Main delivery: GitHub Release (hindi tinatamaan ng Artifact storage quota)
+      - name: Publish APK sa GitHub Release
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          V="${{ github.event.inputs.variant || 'decode' }}"
+          TAG="apk-${V}-latest"
+          gh release delete "$TAG" --cleanup-tag -y || true
+          gh release create "$TAG" "${{ steps.apk.outputs.file }}" \
+            --title "NBA2K20 Tool APK (${V}) - run #${{ github.run_number }}" \
+            --notes "Auto-build. Commit ${{ github.sha }}" \
+            --prerelease
+
+      # Optional lang: kung puno ang quota, hindi na papalya ang buong job
+      - uses: actions/upload-artifact@v4
+        if: success()
+        continue-on-error: true
+        with:
+          name: nba2k20tool-apk-${{ github.event.inputs.variant || 'decode' }}
+          path: bin/*.apk
+          retention-days: 1
+
+      - name: Show build error
+        if: failure()
+        run: |
+          echo "===== ERROR CONTEXT ====="
+          if [ ! -f build.log ]; then echo "no build.log (failed before Build APK)"; exit 1; fi
+          echo "--- lines that look like the real error ---"
+          grep -n -i -E "Command failed|error:|Error:|Exception|Traceback|not found|No such file|FAILED|Aidl|aapt|manifest" build.log | tail -n 25 | cut -c1-200
+          echo "--- last 60 lines ---"
+          tail -n 60 build.log | cut -c1-200
+          echo "===== END ====="
+          exit 1
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: build-log-${{ github.run_id }}
+          path: build.log
+          if-no-files-found: ignore
+          retention-days: 1
+        continue-on-error: true
