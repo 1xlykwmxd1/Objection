@@ -1,0 +1,5 @@
+# Termux (CLI):  pkg install python python-pillow clang make
+#                pip install -r requirements-termux.txt
+archspec
+etcpak
+texture2ddecoder
